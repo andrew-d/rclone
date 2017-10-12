@@ -10,6 +10,7 @@ package drive
 import (
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"path"
@@ -24,6 +25,7 @@ import (
 	"github.com/ncw/rclone/pacer"
 	"github.com/pkg/errors"
 	"github.com/spf13/pflag"
+	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/drive/v2"
@@ -382,6 +384,24 @@ func newPacer() *pacer.Pacer {
 	return pacer.New().SetMinSleep(minSleep).SetPacer(pacer.GoogleDrivePacer)
 }
 
+func impersonatingClient(impersonate, configFile string) (*http.Client, error) {
+	ctx := context.Background()
+
+	b, err := ioutil.ReadFile(configFile)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to read secrets file")
+	}
+
+	config, err := google.JWTConfigFromJSON(b, driveConfig.Scopes...)
+	if err != nil {
+		return nil, errors.Wrap(err, "unable to create JWT config")
+	}
+
+	// Magic happens here
+	config.Subject = impersonate
+	return oauth2.NewClient(ctx, config.TokenSource(ctx)), nil
+}
+
 // NewFs contstructs an Fs from the path, container:path
 func NewFs(name, path string) (fs.Fs, error) {
 	if !isPowerOfTwo(int64(chunkSize)) {
@@ -391,7 +411,20 @@ func NewFs(name, path string) (fs.Fs, error) {
 		return nil, errors.Errorf("drive: chunk size can't be less than 256k - was %v", chunkSize)
 	}
 
-	oAuthClient, _, err := oauthutil.NewClient(name, driveConfig)
+	var oAuthClient *http.Client
+	var err error
+
+	if impersonate := fs.ConfigFileGet(name, "impersonate"); impersonate != "" {
+		configFile := fs.ConfigFileGet(name, "credentials_file")
+		if configFile == "" {
+			return nil, errors.Errorf("drive: no JSON credential file in config")
+		}
+
+		oAuthClient, err = impersonatingClient(impersonate, configFile)
+	} else {
+		oAuthClient, _, err = oauthutil.NewClient(name, driveConfig)
+	}
+
 	if err != nil {
 		log.Fatalf("Failed to configure drive: %v", err)
 	}
